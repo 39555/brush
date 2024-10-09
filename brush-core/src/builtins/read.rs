@@ -2,6 +2,7 @@ use clap::Parser;
 use itertools::Itertools;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use crate::{builtins, commands, env, error, openfiles, sys, variables};
 
@@ -48,8 +49,8 @@ pub(crate) struct ReadCommand {
 
     /// Specify timeout in seconds; fail if the timeout elapses before
     /// input is completed.
-    #[clap(short = 't')]
-    timeout_in_seconds: Option<usize>,
+    #[clap(short = 't', value_parser = parse_duration)]
+    timeout_in_seconds: Option<Duration>,
 
     /// File descriptor to read from instead of stdin.
     #[clap(short = 'u', name = "FD")]
@@ -57,6 +58,11 @@ pub(crate) struct ReadCommand {
 
     /// Optionally, names of variables to receive read input.
     variable_names: Vec<String>,
+}
+
+fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
+    let seconds = arg.parse()?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 #[async_trait::async_trait]
