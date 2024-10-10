@@ -2,7 +2,7 @@ use clap::Parser;
 use itertools::Itertools;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{builtins, commands, env, error, openfiles, sys, variables};
 
@@ -80,13 +80,10 @@ impl builtins::Command for ReadCommand {
         if self.raw_mode {
             tracing::debug!("read -r is not implemented");
         }
-        if self.timeout_in_seconds.is_some() {
-            return error::unimp("read -t");
-        }
 
         // Find the input stream to use.
         #[allow(clippy::cast_lossless)]
-        let input_stream = if let Some(fd_num) = self.fd_num_to_read {
+        let mut input_stream = if let Some(fd_num) = self.fd_num_to_read {
             let fd_num = fd_num as u32;
             context
                 .fd(fd_num)
@@ -95,7 +92,22 @@ impl builtins::Command for ReadCommand {
             context.stdin()
         };
 
-        let input_line = self.read_line(input_stream, context.stdout())?;
+        let orig_term_attr = self.setup_terminal_settings(&input_stream)?;
+        let input_line = if let Some(timeout) = self.timeout_in_seconds {
+            if !matches!(input_stream, openfiles::OpenFile::Stdin) {
+                return error::unimp("reat -t with a regular file (e.g. from input redirection)");
+            }
+            let mut input_stream = TimeoutReader::new(std::io::stdin(), timeout);
+            self.read_line(&mut input_stream, context.stdout()).await
+        } else {
+            self.read_line(&mut input_stream, context.stdout()).await
+        };
+
+        if let Some(orig_term_attr) = &orig_term_attr {
+            input_stream.set_term_attr(orig_term_attr)?;
+        }
+
+        let input_line = input_line?;
 
         if let Some(input_line) = input_line {
             let mut fields: VecDeque<_> = input_line
@@ -174,16 +186,15 @@ enum ReadTermination {
     EndOfInput,
     CtrlC,
     Limit,
+    Timeout,
 }
 
 impl ReadCommand {
-    fn read_line(
+    async fn read_line(
         &self,
-        mut input_file: openfiles::OpenFile,
+        input_file: &mut impl Read,
         mut output_file: openfiles::OpenFile,
     ) -> Result<Option<String>, error::Error> {
-        let orig_term_attr = self.setup_terminal_settings(&input_file)?;
-
         let delimiter = if self.return_after_n_chars_no_delimiter.is_some() {
             None
         } else if let Some(delimiter_str) = &self.delimiter {
@@ -205,8 +216,13 @@ impl ReadCommand {
         let mut buffer = [0; 1]; // 1-byte buffer
 
         let reason = loop {
-            let n = input_file.read(&mut buffer)?;
-            if n == 0 {
+            let n = input_file.read(&mut buffer);
+            if let Err(err) = &n {
+                if matches!(err.kind(), std::io::ErrorKind::TimedOut) {
+                    break ReadTermination::Timeout;
+                }
+            }
+            if n? == 0 {
                 break ReadTermination::EndOfInput; // EOF reached.
             }
 
@@ -242,10 +258,6 @@ impl ReadCommand {
             }
         };
 
-        if let Some(orig_term_attr) = &orig_term_attr {
-            input_file.set_term_attr(orig_term_attr)?;
-        }
-
         match reason {
             ReadTermination::EndOfInput => {
                 if line.is_empty() {
@@ -254,7 +266,7 @@ impl ReadCommand {
                     Ok(Some(line))
                 }
             }
-            ReadTermination::CtrlC => {
+            ReadTermination::CtrlC | ReadTermination::Timeout => {
                 // Discard the input and return.
                 Ok(None)
             }
@@ -281,3 +293,70 @@ impl ReadCommand {
         Ok(orig_term_attr)
     }
 }
+
+#[cfg(unix)]
+use nix::poll;
+#[cfg(unix)]
+use nix::poll::PollFlags;
+#[cfg(unix)]
+use nix::poll::PollTimeout;
+#[cfg(unix)]
+use std::os::unix::io::AsFd;
+
+pub struct TimeoutReader<H> {
+    timeout: Duration,
+    start: Instant,
+    handle: H,
+}
+
+impl<H> TimeoutReader<H>
+where
+    H: Read + AsFd,
+{
+    pub fn new(handle: H, timeout: Duration) -> TimeoutReader<H> {
+        TimeoutReader {
+            timeout,
+            start: Instant::now(),
+            handle,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<H> Read for TimeoutReader<H>
+where
+    H: Read + AsFd,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let elapsed = self.start.elapsed();
+        let rtn = if elapsed >= self.timeout {
+            0
+        } else {
+            let timeout = self.timeout - elapsed;
+            let mut pfd = poll::PollFd::new(self.handle.as_fd(), PollFlags::POLLIN);
+            // TODO: document usafe here
+            let mut s = unsafe { std::slice::from_raw_parts_mut(&mut pfd, 1) };
+
+            let secs = std::cmp::min(timeout.as_secs(), i32::max_value() as u64) as i32;
+            let nanos = timeout.subsec_nanos() as i32;
+            let timeout =
+                PollTimeout::try_from(secs.saturating_mul(1_000).saturating_add(nanos / 1_000_000))
+                    .expect("The number fit into the i32");
+            poll::poll(&mut s, timeout)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        };
+
+        if rtn == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for fd to be ready",
+            ));
+        }
+        self.handle.read(buf)
+    }
+}
+
+// #[cfg(windows)]
+// use std::os::windows::io::AsRawHandle;
+// #[cfg(windows)]
+// use winapi::um;
