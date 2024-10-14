@@ -258,7 +258,7 @@ impl Spec {
         if let Some(glob_pattern) = &self.glob_pattern {
             let pattern = patterns::Pattern::from(glob_pattern.as_str());
             let expansions = pattern.expand(
-                shell.working_dir.as_path(),
+                shell.working_dir.physical(),
                 shell.parser_options().enable_extended_globbing,
                 Some(&patterns::Pattern::accept_all_expand_filter),
             )?;
@@ -903,7 +903,7 @@ fn get_file_completions(shell: &Shell, context: &Context, must_be_dir: bool) -> 
     // TODO: Pass through quoting.
     patterns::Pattern::from(glob)
         .expand(
-            shell.working_dir.as_path(),
+            shell.working_dir.physical(),
             shell.options.extended_globbing,
             Some(&path_filter),
         )

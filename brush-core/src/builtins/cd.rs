@@ -8,12 +8,14 @@ use crate::{builtins, commands};
 /// Change the current shell working directory.
 #[derive(Parser)]
 pub(crate) struct CdCommand {
+    //  TODO: actually this option mean similar to pwd one `don't expans symlinks`
     /// Force following symlinks.
-    #[arg(short = 'L')]
+    #[arg(short = 'L', overrides_with = "use_physical_dir")]
     force_follow_symlinks: bool,
 
     /// Use physical dir structure without following symlinks.
-    #[arg(short = 'P')]
+    // similar to `pwd -P` expand all symlinks
+    #[arg(short = 'P', overrides_with = "force_follow_symlinks")]
     use_physical_dir: bool,
 
     /// Exit with non zero exit status if current working directory resolution fails.
@@ -30,21 +32,27 @@ pub(crate) struct CdCommand {
     target_dir: Option<PathBuf>,
 }
 
+// https://www.gnu.org/software/bash/manual/bash.html#index-cd
+// By default, or when the -L option is supplied, symbolic links in directory are resolved
+
+// If the -e option is supplied with -P and the current working directory cannot be successfully
+// determined after a successful directory change, cd will return an unsuccessful status
+
+// If a non-empty directory name from CDPATH is used, or if ‘-’ is the first argument, and the
+// directory change is successful, the absolute pathname of the new wcrking directory is written to
+// the standard output.
+
 impl builtins::Command for CdCommand {
     async fn execute(
         &self,
         context: commands::ExecutionContext<'_>,
     ) -> Result<crate::builtins::ExitCode, crate::error::Error> {
-        // TODO: implement options
-        if self.force_follow_symlinks
-            || self.use_physical_dir
-            || self.exit_on_failed_cwd_resolution
-            || self.file_with_xattr_as_dir
-        {
+        if self.exit_on_failed_cwd_resolution || self.file_with_xattr_as_dir {
             return crate::error::unimp("options to cd");
         }
 
         let mut should_print = false;
+
         let target_dir = if let Some(target_dir) = &self.target_dir {
             // `cd -', equivalent to `cd $OLDPWD'
             if target_dir.as_os_str() == "-" {
@@ -56,31 +64,47 @@ impl builtins::Command for CdCommand {
                     return Ok(builtins::ExitCode::Custom(1));
                 }
             } else {
-                // TODO: remove clone, and use temporary lifetime extension after rust 1.75
+                // TODO: useless clone
                 target_dir.clone()
             }
         // `cd' without arguments is equivalent to `cd $HOME'
         } else {
             if let Some(home_var) = context.shell.env.get_str("HOME") {
-                PathBuf::from(home_var.to_string())
+                PathBuf::from(home_var.to_string()).into()
             } else {
                 writeln!(context.stderr(), "HOME not set")?;
                 return Ok(builtins::ExitCode::Custom(1));
             }
         };
 
-        if let Err(e) = context.shell.set_working_dir(&target_dir) {
-            writeln!(context.stderr(), "cd: {e}")?;
-            return Ok(builtins::ExitCode::Custom(1));
-        }
+        // TODO: CDPATH, LCD_PRINTPATH, LCD_DOSPELL and LCD_DOVARS
 
-        // Bash compatibility
-        // https://www.gnu.org/software/bash/manual/bash.html#index-cd
-        // If a non-empty directory name from CDPATH is used, or if '-' is the first argument, and
-        // the directory change is successful, the absolute pathname of the new working
-        // directory is written to the standard output.
-        if should_print {
-            writeln!(context.stdout(), "{}", target_dir.display())?;
+        let result = if self.use_physical_dir {
+            context.shell.set_current_working_dir(&*target_dir)
+        // logical dir by default
+        } else {
+            context
+                .shell
+                .set_current_working_dir_from_logical(&*target_dir)
+        };
+        match result {
+            Ok(()) => {
+                // Bash compatibility
+                // https://www.gnu.org/software/bash/manual/bash.html#index-cd
+                // If a non-empty directory name from CDPATH is used, or if '-' is the first
+                // argument, and the directory change is successful, the absolute
+                // pathname of the new working directory is written to the standard
+                // output.
+                if should_print {
+                    writeln!(context.stdout(), "{}", target_dir.display())?;
+                }
+            }
+            Err(e) => {
+                // NOTE: unlike Bash which silently uses the old non-canonical path,
+                // we explicitly return an error.
+                writeln!(context.stderr(), "cd: {e}")?;
+                return Ok(builtins::ExitCode::Custom(1));
+            }
         }
 
         Ok(builtins::ExitCode::Success)

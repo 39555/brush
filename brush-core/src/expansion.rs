@@ -499,7 +499,7 @@ impl<'a> WordExpander<'a> {
         let pattern = patterns::Pattern::from(field.clone());
         let expansions = pattern
             .expand(
-                self.shell.working_dir.as_path(),
+                self.shell.working_dir.physical(),
                 self.parser_options.enable_extended_globbing,
                 Some(&patterns::Pattern::accept_all_expand_filter),
             )
